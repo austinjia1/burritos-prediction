@@ -1,0 +1,354 @@
+---
+title: "What Makes a Good Burrito"
+author: "Austin Jia"
+date: '2022-02-21'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###Libraries
+```{R}
+require(VIM)
+library(ggplot2)
+library(ppcor)
+library(purrr)
+library(tidyr)
+library(mice)
+library(MASS)
+library(caTools)
+library(caret)
+library(glmnet)
+library(dplyr)
+library(randomForest)
+library(e1071)
+library(naivebayes)
+library(psych)
+library(class)
+```
+
+###Reading in Data
+```{R}
+burritos1=read.csv("burritos_01022018.csv", header=T, na.strings=c("","NA"))
+      
+#Fixing Chips
+burritos1$Chips[burritos1$Chips == "x"] <- 1
+burritos1$Chips[burritos1$Chips == "X"] <- 1
+burritos1$Chips[is.na(burritos1$Chips)] <- 0
+
+#Fixing Rec
+burritos1$Rec[burritos1$Rec == "Yes"] <- "Yes"
+burritos1$Rec[burritos1$Rec == "yes"] <- "Yes"
+burritos1$Rec[burritos1$Rec == "yes "] <- "Yes"
+burritos1$Rec[burritos1$Rec == "No"] <- "No"
+
+burritos1$Chips = as.factor(burritos1$Chips)
+burritos1$Rec = as.factor(burritos1$Rec)
+```
+
+###Wrangling Data
+
+We decide to remove a host of variables that will only complicate multiple imputation for data missingness and regression output. We remove Google and Yelp reviews, as we would like to focus only on the reviewers' overall rating. We remove the ingredients list because there are too many variables for the amount of observations collected. Instead, we would like to focus on the reviewers' reviews on the core dimensions of the burrito
+
+```{r}
+#Maintaining only data that we are interested in
+burritos2 = burritos1[ , which(names(burritos1) %in% c("Chips","Cost", "Hunger", "Mass..g.", "Density..g.mL.", "Length", "Circum", "Volume", "Tortilla", "Temp", "Meat", "Fillings", "Meat.filling", "Uniformity", "Salsa", "Synergy", "Wrap", "overall", "Rec"))]
+```
+
+###Exploratory Data Analysis
+
+The correlation matrix of all the numerical variables and all NA values removed shows a high collinearity coefficient between the Synergy covariate and the overall score. I decide to remove Synergy from the dataset as a predictor to satisfy linear regression assumptions, as well as because it is variable with low interpretability. 
+
+```{R}
+#Exploring Multicollinearity
+colnames(burritos1)
+burritos_ratingsonly = burritos1[17:26]
+burritos_ratingsonly_completecases = na.omit(burritos_ratingsonly) #removing NAs so that multicolinearity matrix can work 
+pcor(burritos_ratingsonly_completecases, method = "pearson")
+```
+
+A matrix of distribution plots show that all the variables are roughly normal. Some exceptions to note include Cost and Volume, with right-skewed distributions, as well as Hunger, Meat, Meat.filling, overall, Salsa, Synergy, Temperature, and Tortilla, which are slightly left-skewed distributions. We decide not to log-transform the variables and instead remove the outliers causing the sew, to maintain interpretaibility of the regression output. 
+
+```{r}
+burritos1 %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+```
+
+```{r}
+hist(burritos1$overall)
+```
+
+###Dealing with Data Missingness
+
+18.7% of the data is missing, in such a way that we have 0 complete cases. This motivates removing some less-useful columns and imputing values in other more-useful columns to fill in the data gaps. As we can see from the missingness plot, this is driven by several problematic columns. We remove Queso, Density, Mass, and Google/Yelp reviews as they have over 50% data missingness, which will impede missing data imputation. As the data are most likely not missing completely at random (MCAR), we use multiple imputation using chained equations to impute the missing values, giving us a 100% complete case rate to work with. 
+
+```{r, include = FALSE}
+sum(is.na(burritos2)) / (dim(burritos2)[1] * dim(burritos2)[2]) #percent missing data 
+nrow(burritos2[complete.cases(burritos2), ])/nrow(burritos2) #complete case rate
+```
+
+```{r, include=FALSE}
+missing.prop1 <- apply(burritos2, MARGIN = 2, FUN = function(x) { sum(is.na(x)) })
+missing.prop1 <- missing.prop1 / dim(burritos2)[1]
+missing.prop1 <- data.frame("prop" = missing.prop1,
+                           "var" = names(burritos2))
+ggplot(missing.prop1, aes(x = reorder(var, -prop), y = prop)) + 
+  geom_bar(stat = "identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + 
+  geom_col(colour = "black", fill = "#FF6666") + 
+  xlab("Covariate") + 
+  ylab("Proportion Missing") +
+  ggtitle("The Proportion of Missing Values for Each Covariate")
+
+burritos3 = burritos2[ , -which(names(burritos2) %in% c("Density..g.mL.", "Mass..g."))]
+
+missing.prop2 <- apply(burritos3, MARGIN = 2, FUN = function(x) { sum(is.na(x)) })
+missing.prop2 <- missing.prop2 / dim(burritos3)[1]
+missing.prop2 <- data.frame("prop" = missing.prop2,
+                           "var" = names(burritos3))
+ggplot(missing.prop2, aes(x = reorder(var, -prop), y = prop)) + 
+  geom_bar(stat = "identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + 
+  geom_col(colour = "black", fill = "#FF6666") + 
+  xlab("Covariate") + 
+  ylab("Proportion Missing") +
+  ggtitle("The Proportion of Missing Values for Each Covariate")
+```
+
+```{r, include=FALSE}
+#Mice
+init = mice(burritos3, maxit=0) 
+meth = init$method
+predM = init$predictorMatrix
+burritos4 <- mice(burritos3, m=5, method="cart", predictorMatrix=predM, maxit = 15, seed = 500)
+
+burritos5 = complete(burritos4)
+
+sum(is.na(burritos5)) / (dim(burritos5)[1] * dim(burritos5)[2]) #percent missing data
+nrow(burritos5[complete.cases(burritos5), ])/nrow(burritos5) #complete case rate
+
+missing.prop4 <- apply(burritos5, MARGIN = 2, FUN = function(x) { sum(is.na(x)) })
+missing.prop4 <- missing.prop4 / dim(burritos5)[1]
+missing.prop4 <- data.frame("prop" = missing.prop4,
+                           "var" = names(burritos5))
+ggplot(missing.prop4, aes(x = reorder(var, -prop), y = prop)) + 
+  geom_bar(stat = "identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + 
+  geom_col(colour = "black", fill = "#FF6666") + 
+  xlab("Covariate") + 
+  ylab("Proportion Missing") +
+  ggtitle("The Proportion of Missing Values for Each Covariate")
+
+
+```
+
+###Modeling
+
+```{r, include = FALSE}
+# Split into Training and Testing
+set.seed(12)
+sample = sample.split(burritos5, SplitRatio = .8)
+train = subset(burritos5, sample == TRUE)
+test  = subset(burritos5, sample == FALSE)
+dim(train)
+dim(test)
+
+#Evaluation Testing Algorithm
+eval_metrics = function(model, df, predictions, target){
+    resids = df[,target] - predictions
+    resids2 = resids**2
+    N = length(predictions)
+    r2 = as.character(round(summary(model)$r.squared, 2))
+    adj_r2 = as.character(round(summary(model)$adj.r.squared, 2))
+    print(adj_r2) #Adjusted R-squared
+    print(as.character(round(sqrt(sum(resids2)/N), 2))) #RMSE
+}
+
+```
+
+###Regression Modeling -- Overall
+
+####OLS
+```{R}
+fit1 <- lm(overall ~ Circum + Length + Cost + Hunger + Tortilla + Temp + Meat + Fillings + Meat.filling + Uniformity + Salsa, data=train)
+summary(fit1) # show results
+
+#Residuals Plot
+res1 = resid(fit1)
+plot(fitted(fit1), res1)
+abline(0,0)
+
+#Q-Q plot
+qqnorm(res1)
+qqline(res1)
+
+#Predicting and evaluating the model on train data
+predictions = predict(fit1, newdata = train)
+eval_metrics(fit1, train, predictions, target = 'overall')
+
+#Predicting and evaluating the model on test data
+predictions = predict(fit1, newdata = test)
+eval_metrics(fit1, test, predictions, target = 'overall')
+```
+
+R-squared first here
+
+####Ridge
+```{R}
+#Pre-processing: Regularization needs to work with a matrix
+cols_reg = c('Chips', 'Cost', 'Hunger', 'Length', 'Circum', 'Tortilla', 'Temp', 'Meat', 'Fillings', 'Meat.filling', 'Uniformity', 'Salsa', 'overall')
+
+dummies <- dummyVars(overall ~ ., data = burritos5[,cols_reg])
+
+train_dummies = predict(dummies, newdata = train[,cols_reg])
+
+test_dummies = predict(dummies, newdata = test[,cols_reg])
+
+x = as.matrix(train_dummies)
+y_train = train$overall
+
+x_test = as.matrix(test_dummies)
+y_test = test$overall
+
+#Tuning the parameter
+lambdas <- 10^seq(2, -3, by = -.1)
+ridge_reg = glmnet(x, y_train, nlambda = 25, alpha = 0, family = 'gaussian', lambda = lambdas)
+
+summary(ridge_reg)
+
+cv_ridge <- cv.glmnet(x, y_train, alpha = 0, lambda = lambdas)
+optimal_lambda <- cv_ridge$lambda.min
+optimal_lambda
+
+#Model interpretation
+coef(cv_ridge)
+
+#Evaluating fit
+# Compute R^2 from true and predicted values
+eval_results <- function(true, predicted, df) {
+  SSE <- sum((predicted - true)^2)
+  SST <- sum((true - mean(true))^2)
+  R_square <- 1 - SSE / SST
+  RMSE = sqrt(SSE/nrow(df))
+
+  
+  # Model performance metrics
+data.frame(
+  RMSE = RMSE,
+  Rsquare = R_square
+)
+  
+}
+
+# Prediction and evaluation on train data
+predictions_train <- predict(ridge_reg, s = optimal_lambda, newx = x)
+eval_results(y_train, predictions_train, train)
+
+# Prediction and evaluation on test data
+predictions_test <- predict(ridge_reg, s = optimal_lambda, newx = x_test)
+eval_results(y_test, predictions_test, test)
+```
+
+Improvement observed over linear regression
+
+####Lasso
+
+```{r}
+lambdas <- 10^seq(2, -3, by = -.1)
+
+# Setting alpha = 1 implements lasso regression
+lasso_reg <- cv.glmnet(x, y_train, alpha = 1, lambda = lambdas, standardize = TRUE, nfolds = 5)
+
+coef(lasso_reg)
+
+# Best 
+lambda_best <- lasso_reg$lambda.min 
+lambda_best
+
+#Evaluating Fit
+lasso_model <- glmnet(x, y_train, alpha = 1, lambda = lambda_best, standardize = TRUE)
+
+predictions_train <- predict(lasso_model, s = lambda_best, newx = x)
+eval_results(y_train, predictions_train, train)
+
+predictions_test <- predict(lasso_model, s = lambda_best, newx = x_test)
+eval_results(y_test, predictions_test, test)
+```
+
+###Classification Modeling -- Rec
+
+####Logistic Regression
+```{r}
+cols_class= c('Chips', 'Cost', 'Hunger', 'Length', 'Circum', 'Tortilla', 'Temp', 'Meat', 'Fillings', 'Meat.filling', 'Uniformity', 'Salsa', 'Rec')
+
+logit1 <- glm(Rec ~ Circum + Length + Cost + Hunger + Tortilla + Temp + Meat + Fillings + Meat.filling + Uniformity + Salsa, data = train, family = "binomial")
+summary(logit1)
+
+
+#Model Evaluation
+logit1.prob <- predict(logit1, test, type = "response")
+logit1.pred <- rep("No", 91)
+logit1.pred[logit1.prob > 0.5] <- "Yes"
+cm.full = table(logit1.pred, test$Rec)
+accuracy.full = mean(logit1.pred == test$Rec)
+mce.full = mean(logit1.pred != test$Rec)
+```
+
+####Naive Bayes
+```{R}
+nb <- naive_bayes(Rec ~ ., data = train, usekernel = T) 
+nb.pred <- predict(nb, test, type = 'prob')
+nb.test.pred <- predict(nb, test)
+table(test$Rec, nb.test.pred)
+accuracy.nb = (24+56)/(24+56+4+7)
+accuracy.nb
+```
+
+####Random Forest
+```{r}
+#Model Building
+rf <- randomForest(Rec ~ ., data = train, ntree = 100, 
+    importance = TRUE)
+summary(rf)
+varImpPlot(rf)
+
+prediction.rf <-predict(rf, test)
+confusionMatrix(prediction.rf, test$Rec)
+accuracy.rf = .91
+accuracy.rf
+```
+
+####SVM
+```{R}
+set.seed(2234)
+bestcost.radial<- tune(svm, Rec ~ ., data = train, kernel = "radial", ranges = list(cost = seq(.01, 10, by = 0.1)))
+summary(bestcost.radial)
+
+svm.radial.bestcost <- svm(Rec ~ ., kernel = "radial", data = train, cost = bestcost.radial$best.parameter$cost)
+summary(svm.radial.bestcost)
+
+test.pred.radial.bestcost <- predict(svm.radial.bestcost, test)
+table(test$Rec, test.pred.radial.bestcost)
+accuracy.svm = (24+58)/(24+58+2+7)
+accuracy.svm
+```
+
+###Appendix
+
+####Logit to Prob
+```{r, include = FALSE}
+#Function to display probability
+logit2prob <- function(logit){
+  odds <- exp(logit)
+  prob <- odds / (1 + odds)
+  return(prob)
+}
+```
+
+https://www.pluralsight.com/guides/linear-lasso-and-ridge-regression-with-r
